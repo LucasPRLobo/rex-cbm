@@ -1,0 +1,22 @@
+# Large or third-party content: each person keeps their own local copy
+data/
+ConceptBottleneck/
+ReX/
+
+# Notebooks are not shared yet
+notebooks/
+*.ipynb
+.ipynb_checkpoints/
+
+# Results produced by running scripts
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

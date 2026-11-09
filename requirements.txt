@@ -1,0 +1,9 @@
+# Python 3.13 (conda env "rex"). Install torch/torchvision for your CUDA version first:
+# https://pytorch.org/get-started/locally/
+torch>=2.5
+torchvision>=0.20
+rex-xai==0.4.1
+numpy<2
+pandas
+matplotlib
+pillow
