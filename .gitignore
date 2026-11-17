@@ -5,9 +5,8 @@ ReX/
 
 # Notebooks are not shared yet
 notebooks/
-*.ipynb
 .ipynb_checkpoints/
-
+explanation images
 # Results produced by running scripts
 outputs/
 

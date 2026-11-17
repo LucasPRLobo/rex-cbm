@@ -16,8 +16,8 @@ import torch
 import torchvision.transforms as transforms
 from PIL import Image
 
-ROOT = Path(__file__).resolve().parents[1]
-DATA = ROOT / "data"
+ROOT = Path("D:\\XAI")
+DATA = ROOT
 sys.path.insert(0, str(ROOT / "ConceptBottleneck"))  # checkpoints unpickle classes from CUB.template_model
 
 # The 112 of 312 CUB attributes used by the paper, 0-based (from CUB/generate_new_data.py).
@@ -42,6 +42,70 @@ def load_checkpoint(name):
     return torch.load(path, map_location="cpu", weights_only=False).eval()
 
 
+import torch
+import torch.nn as nn
+
+CHECKPOINTS = {
+    "concept":       "ConceptModel__Seed1",
+    "independent":   "IndependentModel_WithVal___Seed1",
+    "sequential":    "SequentialModel_WithVal__Seed1",
+    "joint":         "Joint0.01Model__Seed1",
+    "joint_sigmoid": "Joint0.01SigmoidModel__Seed1",
+}
+
+class CBM(nn.Module):
+    """Load one CBM variant by name. forward(x) -> (class_logits | None, concept_logits)."""
+
+    def __init__(self, name, device="cuda"):
+        super().__init__()
+        if name not in CHECKPOINTS:
+            raise ValueError(f"unknown model {name!r}; choose from {list(CHECKPOINTS)}")
+        self.name = name
+        self.net = nn.ModuleDict()
+
+        if name in ("concept", "independent", "sequential"):
+            self.net["concept"] = load_checkpoint(CHECKPOINTS["concept"])
+        if name in ("independent", "sequential"):
+            self.net["head"] = load_checkpoint(CHECKPOINTS[name])
+        if name in ("joint", "joint_sigmoid"):
+            self.net["joint"] = load_checkpoint(CHECKPOINTS[name])
+
+        self.to(device).eval()
+        for p in self.parameters():
+            p.requires_grad_(False)
+
+    def _concepts(self, x):
+        return torch.cat(self.net["concept"](x), dim=1)
+
+    def forward(self, x):
+        if self.name == "concept":
+            return None, self._concepts(x)
+        if self.name == "independent":      # head trained on true concepts -> probabilities
+            c = self._concepts(x)
+            return self.net["head"](torch.sigmoid(c)), c
+        if self.name == "sequential":       # head trained on predicted logits
+            c = self._concepts(x)
+            return self.net["head"](c), c
+        out = self.net["joint"](x)          # joint / joint_sigmoid
+        return out[0], torch.cat(out[1:], dim=1)
+
+    def concept_logits(self, x):
+        return self.forward(x)[1]
+
+    def class_logits(self, x):
+        return self.forward(x)[0]
+
+
+class ConceptView(nn.Module):
+    """Presents concept k of a CBM as a 2-class classifier for ReX."""
+    def __init__(self, cbm, k):
+        super().__init__()
+        self.cbm, self.k = cbm, k
+
+    def forward(self, x):
+        z = self.cbm.concept_logits(x)[:, self.k]
+        return torch.stack([torch.zeros_like(z), z], dim=1)
+
 def load_models():
     """Return {name: fn}, where fn maps images to (class_logits, concept_logits)."""
     concept_model = load_checkpoint("ConceptModel__Seed1")
@@ -49,7 +113,7 @@ def load_models():
     sequential_head = load_checkpoint("SequentialModel_WithVal__Seed1")
     joint = load_checkpoint("Joint0.01Model__Seed1")
     joint_sigmoid = load_checkpoint("Joint0.01SigmoidModel__Seed1")
-
+    
     def run_joint(model):
         def run(x):
             out = model(x)
@@ -75,6 +139,7 @@ def load_models():
 def load_test_records():
     with open(DATA / "CUB_processed" / "test.pkl", "rb") as f:
         return pickle.load(f)
+
 
 
 def image_path(record):
@@ -119,6 +184,7 @@ def evaluate(models, records, batch_size):
         }
         for name in models
     }
+
 
 
 @torch.no_grad()
