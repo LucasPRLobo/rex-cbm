@@ -12,7 +12,7 @@ from torchvision import transforms
 from rex_xai.input.input_data import Data
 from rex_xai.lib import ReX
 from rex_xai.responsibility.prediction import Prediction
-from scripts.run_cbm import CBM, load_image,image_path  # your wrapper from earlier
+from scripts.run_cbm import CBM, load_image,image_path, load_test_records  # your wrapper from earlier
 from pathlib import Path
 from .frozen_concept import FrozenClassView
 MODEL_SHAPE = ("N", 3, 299, 299)
@@ -48,7 +48,7 @@ def make_prediction_function(cbm, k,concept=True,frozen=False):
     """
     @torch.no_grad()
     def frozen_concept_prediction_function(mutants, target=None, raw=False):
-        #
+        pass
 
     @torch.no_grad()
     def class_prediction_function(mutants, target=None, raw=False):
@@ -187,20 +187,78 @@ def explain_concept(rex,
         "stats": rex.stats,
         "rex": rex,                                # keep for rex.show() etc.
     }
+import numpy as np
 
+def aggregate_seeds(masks, stats, majority=0.5):
+    """Collapse per-seed ReX outputs into one result.
 
-def explain_all_active(cbm, img_path, device="cuda", concepts=None, **kwargs):
+    masks: {seed: bool tensor (H, W)}    stats: {seed: dict}
+    """
+    stack = torch.stack([m.float().cpu() for m in masks.values()])   # (S, H, W)
+    freq = stack.mean(0)                          # (H, W) in [0, 1]: share of seeds that picked each pixel
+    consensus = freq >= majority                  # (H, W) bool majority-vote mask
+
+    # stability: pairwise IoU between seeds (1.0 = identical, low = seed-sensitive)
+    b = stack.bool()
+    ious = []
+    for i in range(len(b)):
+        for j in range(i + 1, len(b)):
+            union = (b[i] | b[j]).sum().item()
+            ious.append((b[i] & b[j]).sum().item() / union if union else 1.0)
+
+    # stats: mean and std for numeric keys, first value for anything else
+    mean_stats, std_stats = {}, {}
+    for key in next(iter(stats.values())):
+        vals = [s[key] for s in stats.values() if key in s]
+        numeric = all(isinstance(v, (int, float, np.integer, np.floating))
+                      and not isinstance(v, bool) for v in vals)
+        if numeric:
+            mean_stats[key] = float(np.mean(vals))
+            std_stats[key] = float(np.std(vals))
+        else:
+            mean_stats[key] = vals[0]
+
+    return {
+        "freq": freq.numpy(),
+        "consensus": consensus.numpy(),
+        "mean_area": float(b.float().mean(dim=(1, 2)).mean()),     # average of per-seed areas
+        "consensus_area": float(consensus.float().mean()),
+        "pairwise_iou": float(np.mean(ious)) if ious else 1.0,
+        "stats_mean": mean_stats,
+        "stats_std": std_stats,
+    }
+
+def run_rex_seeds(rex, seeds, threshold=0.0):
+    masks = {}
+    stats = {}
+    rex.args.minimum_confidence_threshold = threshold
+
+    for seed in seeds:
+        rex.args.seed = seed
+        rex.calculate_responsibility().generate_explanation_object()
+        stats[seed] = dict(rex.stats)
+        rex.extract_sufficient_explanation()
+
+        mask = rex.explanation.sufficiency_mask
+        assert (mask[0] == mask[1]).all() and (mask[0] == mask[2]).all()  # all 3 channels identical
+        masks[seed] = mask[0].clone()                                      # keep one [299, 299] channel
+
+    return masks, stats
+
+def explain_all_active(cbm, record, device="cuda", concepts=None, seeds = [10,50,100],**kwargs):
     """Explain every active concept (or the subset `concepts`) for one image."""
-    active, probs = active_concepts(cbm, img_path, device)
+    active, probs = active_concepts(cbm, record, device)
     todo = active if concepts is None else [k for k in concepts if k in active]
     results = {}
     for k in todo:
-        out = explain_concept(cbm, k, img_path, device, **kwargs)
+        rex, image = setup_rex(cbm,k,record,device)
+        masks,stats = run_rex_seeds(rex,seeds)
+        out = aggregate_seeds(masks,stats)
         if out is not None:
             results[k] = out
             print(f"concept {k:3d}  p={probs[k]:.3f}  "
-                  f"rex_conf={out['target_confidence']:.3f}  "
-                  f"area={out['area_fraction']:.3%}")
+                  f"rex_conf={out["stats_mean"]['target_confidence']:.3f}  "
+                  f"area={out['mean_area']:.3%}")
     return results
 
 
@@ -208,13 +266,15 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     cbm = CBM("joint", device=device)            # switch model by name
     img = "path/to/cub_image.jpg"
+    records  = load_test_records()
 
-    # 1) quick test of a single concept; check rex_conf ~= p (preprocessing sanity check)
-    active, probs = active_concepts(cbm, img, device)
-    print(f"{len(active)} active concepts")
-    k = active[0]
-    out = explain_concept(cbm, k, img, device)
-    print(f"concept {k}: p={probs[k]:.4f} vs ReX conf={out['target_confidence']:.4f}")
+    # for record in records:
+    # # # 1) quick test of a single concept; check rex_conf ~= p (preprocessing sanity check)
+    # # active, probs = active_concepts(cbm, img, device)
+    # # print(f"{len(active)} active concepts")
+    # # k = active[0]
+    # # out = explain_concept(cbm, k, img, device)
+    # # print(f"concept {k}: p={probs[k]:.4f} vs ReX conf={out['target_confidence']:.4f}")
 
-    # 2) all active concepts for this image
-    results = explain_all_active(cbm, img, device, iters=20, search_limit=1000)
+    # # 2) all active concepts for this image
+    # results = explain_all_active(cbm, img, device, iters=20, search_limit=1000)
