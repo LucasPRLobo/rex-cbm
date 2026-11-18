@@ -1,81 +1,41 @@
-"""Run ReX causal explanations on individual concepts of a concept bottleneck model.
+"""Run ReX causal explanations on individual concepts (or class outputs) of a CBM.
 
-Each concept k is presented to ReX as a 2-class problem: [concept off, concept on].
-Only concepts the CBM predicts as ON are explained (the ReX target is then class 1).
+Concept k is presented to ReX as a 2-class problem [concept off, concept on]; only
+concepts the CBM predicts as ON are explained (the ReX target is then class 1).
 """
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 
-from rex_xai.input.input_data import Data
 from rex_xai.lib import ReX
 from rex_xai.responsibility.prediction import Prediction
-from scripts.run_cbm import CBM, load_image,image_path, load_test_records  # your wrapper from earlier
-from pathlib import Path
+
+from scripts.run_cbm import CBM, ConceptView, load_image, image_path, load_test_records
 from .frozen_concept import FrozenClassView
+
 MODEL_SHAPE = ("N", 3, 299, 299)
 
-# Must match the transforms the CBMs were trained/evaluated with.
-transform = transforms.Compose([
-    transforms.CenterCrop(299),
-    transforms.ToTensor(),                                   # (3, H, W) in [0, 1]
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[2, 2, 2]),
-])
 
+# --------------------------------------------------------------------------- #
+# Prediction function
+# --------------------------------------------------------------------------- #
+def make_prediction_function(logits_fn):
+    """ReX prediction function for ANY model that maps images -> (B, C) logits.
 
-def preprocess(path, device) -> Data:
-    """Build the Data object ReX needs.
+    concept k      : logits_fn = ConceptView(cbm, k)          (C = 2: [off, on])
+    class output   : logits_fn = cbm.class_logits             (C = 200)
+    frozen concepts: logits_fn = FrozenClassView(cbm, idx, vals)
 
-    ReX.set_rgb_image() does NOT populate data.data, so we build it ourselves:
-      data.input -> PIL image (cropped identically), used only for visualisation
-      data.data  -> normalised tensor (1, 3, 299, 299) fed to the model
+    ReX calls f(mutants, target) -> list[Prediction], and f(mutants, raw=True)
+    -> (B, C) probabilities (used by the insertion/deletion evaluation).
     """
-    img = Image.open(path).convert("RGB")
-    data = Data(img, MODEL_SHAPE, device, mode="RGB")
-    data.data = transform(img).unsqueeze(0).to(device)
-    data.input = transforms.functional.center_crop(img, 299)
-    return data
-
-
-def make_prediction_function(cbm, k,concept=True,frozen=False):
-    """ReX prediction function for concept k.
-
-    ReX calls it as f(mutants, target) -> list[Prediction], and as
-    f(mutants, raw=True) -> (B, n_classes) probabilities (used by the
-    insertion/deletion evaluation).
-    """
-    @torch.no_grad()
-    def frozen_concept_prediction_function(mutants, target=None, raw=False):
-        pass
-
-    @torch.no_grad()
-    def class_prediction_function(mutants, target=None, raw=False):
-        z = cbm.class_logits(mutants)                 # (B,) concept logit
-        logits = torch.stack([torch.zeros_like(z), z], dim=1)  # (B, 2): [off, on]
-        probs = F.softmax(logits, dim=1)                       # [:, 1] == sigmoid(z)
-        if raw:
-            return probs
-        conf, cls = probs.max(dim=1)
-        preds = []
-        for i in range(probs.shape[0]):
-            t_conf = probs[i, target.classification].item() if target is not None else None
-            preds.append(
-                Prediction(
-                    pred=cls[i].item(),
-                    conf=conf[i].item(),
-                    target=target,              # Prediction object; class is extracted inside
-                    target_confidence=t_conf,
-                )
-            )
-
-
     @torch.no_grad()
     def prediction_function(mutants, target=None, raw=False):
-        z = cbm.concept_logits(mutants)[:, k]                 # (B,) concept logit
-        logits = torch.stack([torch.zeros_like(z), z], dim=1)  # (B, 2): [off, on]
-        probs = F.softmax(logits, dim=1)                       # [:, 1] == sigmoid(z)
+        probs = F.softmax(logits_fn(mutants), dim=1)
         if raw:
             return probs
         conf, cls = probs.max(dim=1)
@@ -86,108 +46,117 @@ def make_prediction_function(cbm, k,concept=True,frozen=False):
                 Prediction(
                     pred=cls[i].item(),
                     conf=conf[i].item(),
-                    target=target,              # Prediction object; class is extracted inside
+                    target=target,           # Prediction object; class is extracted inside
                     target_confidence=t_conf,
                 )
             )
         return preds
 
-    return prediction_function if concept else class_prediction_function
+    return prediction_function
+
+
+# --------------------------------------------------------------------------- #
+# Concept selection
+# --------------------------------------------------------------------------- #
 @torch.no_grad()
 def active_concepts(cbm, record, device="cuda", threshold=0.5):
     """Indices of concepts the CBM predicts as ON, plus all concept probabilities."""
-    data : torch.Tensor = load_image(record).unsqueeze(0).to(device)
-    p = torch.sigmoid(cbm.concept_logits(data.data))[0]
+    x = load_image(record).unsqueeze(0).to(device)
+    p = torch.sigmoid(cbm.concept_logits(x))[0]
     return (p > threshold).nonzero().flatten().tolist(), p.cpu().numpy()
+
 
 @torch.no_grad()
 def inactive_concepts(cbm, record, device="cuda", threshold=0.5):
-    """Indices of concepts the CBM predicts as OF, plus all concept probabilities."""
-    data : torch.Tensor = load_image(record).unsqueeze(0).to(device)
-    p = torch.sigmoid(cbm.concept_logits(data.data))[0]
-    return (p < threshold).nonzero().flatten().tolist(), p.cpu().numpy()
+    """Indices of concepts predicted OFF, closest to firing first, plus all probabilities."""
+    x = load_image(record).unsqueeze(0).to(device)
+    p = torch.sigmoid(cbm.concept_logits(x))[0]
+    idx = (p < threshold).nonzero().flatten()
+    idx = idx[p[idx].argsort(descending=True)]
+    return idx.tolist(), p.cpu().numpy()
 
+
+# --------------------------------------------------------------------------- #
+# Image helpers
+# --------------------------------------------------------------------------- #
 def crop_image(img, resol):
-    transform = transforms.Compose([
-        transforms.CenterCrop(resol)
-    ])
-
-    return transform(img)
+    return transforms.CenterCrop(resol)(img)
 
 
-def get_bird_mask(record, resol=299):
-    segmentation_path = Path(str(image_path(record)).replace("\\images\\", "\\segmentations\\")).with_suffix(".png")
+def get_bird_mask(record, resol=299, device="cpu"):
+    """Whole-bird segmentation mask, cropped exactly like the model input."""
+    segmentation_path = Path(
+        str(image_path(record)).replace("\\images\\", "\\segmentations\\")
+    ).with_suffix(".png")
     seg_img = Image.open(segmentation_path).convert("L")
-    cropped_seg_img = crop_image(seg_img, resol)
-    cropped_tensor = torch.from_numpy(np.array(cropped_seg_img))
-    return (cropped_tensor > 127).to(device)
+    cropped = torch.from_numpy(np.array(crop_image(seg_img, resol)))
+    return (cropped > 127).to(device)
+
 
 def to_tensor(img):
-    transform = transforms.Compose([
+    """Same normalisation as the CBM training pipeline (apply AFTER cropping)."""
+    return transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(mean = [0.5, 0.5, 0.5], std = [2, 2, 2])
-    ])
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[2, 2, 2]),
+    ])(img)
 
-    return transform(img)
 
-def setup_rex(cbm,
-              k,
-              record, 
-              device="cuda",
-              iters=20, 
-              search_limit=1000,
-              concept = True):
-    
-    
-    rex = ReX(model=cbm,
-            model_shape=MODEL_SHAPE,
-            device=device,
-            mode="RGB",
-            prediction_function=make_prediction_function(cbm, k,concept=concept),
-        )
-    img_path = image_path(record)
-    image = rex.set_rgb_image(img_path)
-    cropped_img  = crop_image(image,299)
+# --------------------------------------------------------------------------- #
+# ReX setup
+# --------------------------------------------------------------------------- #
+def setup_rex(cbm, k, record, device="cuda", iters=20, search_limit=1000,
+              batch_size=64, view=None):
+    """Build a ReX object ready to run.
+
+    Default: explain concept k. For a class-level run pass `view`, an nn.Module or
+    callable mapping images -> (B, C) logits (e.g. FrozenClassView); k is then unused.
+    """
+    logits_fn = view if view is not None else ConceptView(cbm, k)
+    rex = ReX(
+        model=cbm,
+        model_shape=MODEL_SHAPE,
+        device=device,
+        mode="RGB",
+        prediction_function=make_prediction_function(logits_fn),
+    )
+    image = rex.set_rgb_image(image_path(record))
+    cropped_img = crop_image(image, 299)
 
     rex.args.iters = iters
     rex.args.search_limit = search_limit
+    rex.args.batch_size = batch_size           # ReX default is 1, which is very slow
     rex.set_input(cropped_img)
-    transformed_img = to_tensor(cropped_img).unsqueeze(0).to(device)
-    rex.set_transformed_data(transformed_img)
-    rex.set_target() 
-    return rex,image      
+    rex.set_transformed_data(to_tensor(cropped_img).unsqueeze(0).to(device))
+    rex.set_target()
+    return rex, image
 
 
+# --------------------------------------------------------------------------- #
+# Multi-seed running and aggregation
+# --------------------------------------------------------------------------- #
+def to_2d(mask):
+    """(1,3,H,W) or (3,H,W) bool tensor -> (H,W), union over leading dims."""
+    while mask.dim() > 2:
+        mask = mask.any(0)
+    return mask
 
-def explain_concept(rex, 
-                    target_classification=1,
-                    batch_size=64,
-                    only_if_on=True):
-    """Run ReX for one concept. Returns a dict, or None if the concept is off."""  
-    # target = top class of the [off, on] pair
 
-    target = rex.data.target
-    if only_if_on and target.classification != target_classification:
-        return None
+def run_rex_seeds(rex, seeds, threshold=0.0):
+    """Run ReX once per seed. Returns (masks, stats, responsibility maps) keyed by seed."""
+    masks, stats, resps = {}, {}, {}
+    rex.args.minimum_confidence_threshold = threshold
+    target_cls = rex.data.target.classification
 
-    rex.calculate_responsibility()
-    rex.extract_sufficient_explanation()
+    for seed in seeds:
+        rex.args.seed = seed                    # applied inside calculate_responsibility
+        rex.calculate_responsibility().generate_explanation_object()
+        stats[seed] = dict(rex.stats)
+        resps[seed] = np.array(rex.maps.get(target_cls))
+        rex.extract_sufficient_explanation()
+        masks[seed] = to_2d(rex.explanation.sufficiency_mask).clone()
 
-    # explanation mask has the shape of data.data: (1, 3, H, W) bool -> (H, W)
-    mask = rex.explanation.sufficiency_mask[0].any(0).cpu().numpy()
-    resp = rex.maps.get(target.classification)               # (H, W) responsibility map
+    return masks, stats, resps
 
-    return {
-        "concept": k,
-        "target_class": target.classification,
-        "target_confidence": target.confidence,   # should equal sigmoid(logit) for "on"
-        "mask": mask,
-        "area_fraction": float(mask.mean()),
-        "responsibility": resp,
-        "stats": rex.stats,
-        "rex": rex,                                # keep for rex.show() etc.
-    }
-import numpy as np
 
 def aggregate_seeds(masks, stats, majority=0.5):
     """Collapse per-seed ReX outputs into one result.
@@ -195,10 +164,9 @@ def aggregate_seeds(masks, stats, majority=0.5):
     masks: {seed: bool tensor (H, W)}    stats: {seed: dict}
     """
     stack = torch.stack([m.float().cpu() for m in masks.values()])   # (S, H, W)
-    freq = stack.mean(0)                          # (H, W) in [0, 1]: share of seeds that picked each pixel
-    consensus = freq >= majority                  # (H, W) bool majority-vote mask
+    freq = stack.mean(0)                    # share of seeds that picked each pixel
+    consensus = freq >= majority            # majority-vote mask
 
-    # stability: pairwise IoU between seeds (1.0 = identical, low = seed-sensitive)
     b = stack.bool()
     ious = []
     for i in range(len(b)):
@@ -206,7 +174,6 @@ def aggregate_seeds(masks, stats, majority=0.5):
             union = (b[i] | b[j]).sum().item()
             ious.append((b[i] & b[j]).sum().item() / union if union else 1.0)
 
-    # stats: mean and std for numeric keys, first value for anything else
     mean_stats, std_stats = {}, {}
     for key in next(iter(stats.values())):
         vals = [s[key] for s in stats.values() if key in s]
@@ -221,60 +188,49 @@ def aggregate_seeds(masks, stats, majority=0.5):
     return {
         "freq": freq.numpy(),
         "consensus": consensus.numpy(),
-        "mean_area": float(b.float().mean(dim=(1, 2)).mean()),     # average of per-seed areas
+        "mean_area": float(b.float().mean(dim=(1, 2)).mean()),
         "consensus_area": float(consensus.float().mean()),
         "pairwise_iou": float(np.mean(ious)) if ious else 1.0,
         "stats_mean": mean_stats,
         "stats_std": std_stats,
     }
 
-def run_rex_seeds(rex, seeds, threshold=0.0):
-    masks = {}
-    stats = {}
-    rex.args.minimum_confidence_threshold = threshold
 
-    for seed in seeds:
-        rex.args.seed = seed
-        rex.calculate_responsibility().generate_explanation_object()
-        stats[seed] = dict(rex.stats)
-        rex.extract_sufficient_explanation()
+# --------------------------------------------------------------------------- #
+# Explain every active concept for one image
+# --------------------------------------------------------------------------- #
+def explain_all_active(cbm, record, device="cuda", concepts=None,
+                       seeds=(10, 50, 100), **rex_kwargs):
+    """Explain every active concept (or the subset `concepts`) for one image.
 
-        mask = rex.explanation.sufficiency_mask
-        assert (mask[0] == mask[1]).all() and (mask[0] == mask[2]).all()  # all 3 channels identical
-        masks[seed] = mask[0].clone()                                      # keep one [299, 299] channel
-
-    return masks, stats
-
-def explain_all_active(cbm, record, device="cuda", concepts=None, seeds = [10,50,100],**kwargs):
-    """Explain every active concept (or the subset `concepts`) for one image."""
+    rex_kwargs (iters, search_limit, batch_size) are passed to setup_rex.
+    """
     active, probs = active_concepts(cbm, record, device)
     todo = active if concepts is None else [k for k in concepts if k in active]
     results = {}
+
     for k in todo:
-        rex, image = setup_rex(cbm,k,record,device)
-        masks,stats = run_rex_seeds(rex,seeds)
-        out = aggregate_seeds(masks,stats)
-        if out is not None:
-            results[k] = out
-            print(f"concept {k:3d}  p={probs[k]:.3f}  "
-                  f"rex_conf={out["stats_mean"]['target_confidence']:.3f}  "
-                  f"area={out['mean_area']:.3%}")
+        try:
+            rex, _ = setup_rex(cbm, k, record, device, **rex_kwargs)
+            target = rex.data.target
+
+            if target.classification != 1:      # ReX disagrees with active_concepts
+                print(f"concept {k:3d}  skipped: ReX target is 'off' (p={probs[k]:.3f})")
+                continue
+            if abs(target.confidence - probs[k]) > 1e-2:
+                print(f"concept {k:3d}  WARNING: rex_conf={target.confidence:.3f} "
+                      f"!= p={probs[k]:.3f} (check preprocessing)")
+
+            masks, stats, resps = run_rex_seeds(rex, seeds)
+            agg = aggregate_seeds(masks, stats)
+            agg["responsibility"] = np.mean(list(resps.values()), axis=0)
+        except Exception as e:
+            print(f"concept {k:3d}  failed: {e}")
+            continue
+
+        agg.update(concept=k, prob=float(probs[k]), rex_conf=float(target.confidence))
+        results[k] = agg
+        print(f"concept {k:3d}  p={probs[k]:.3f}  rex_conf={target.confidence:.3f}  "
+              f"area={agg['mean_area']:.3%}  seed_iou={agg['pairwise_iou']:.2f}")
+
     return results
-
-
-if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    cbm = CBM("joint", device=device)            # switch model by name
-    img = "path/to/cub_image.jpg"
-    records  = load_test_records()
-
-    # for record in records:
-    # # # 1) quick test of a single concept; check rex_conf ~= p (preprocessing sanity check)
-    # # active, probs = active_concepts(cbm, img, device)
-    # # print(f"{len(active)} active concepts")
-    # # k = active[0]
-    # # out = explain_concept(cbm, k, img, device)
-    # # print(f"concept {k}: p={probs[k]:.4f} vs ReX conf={out['target_confidence']:.4f}")
-
-    # # 2) all active concepts for this image
-    # results = explain_all_active(cbm, img, device, iters=20, search_limit=1000)
