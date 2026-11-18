@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
@@ -85,8 +86,9 @@ def crop_image(img, resol):
 
 def get_bird_mask(record, resol=299, device="cpu"):
     """Whole-bird segmentation mask, cropped exactly like the model input."""
+    p = image_path(record)               # works on Windows and Linux
     segmentation_path = Path(
-        str(image_path(record)).replace("\\images\\", "\\segmentations\\")
+        *["segmentations" if part == "images" else part for part in p.parts]
     ).with_suffix(".png")
     seg_img = Image.open(segmentation_path).convert("L")
     cropped = torch.from_numpy(np.array(crop_image(seg_img, resol)))
@@ -197,40 +199,106 @@ def aggregate_seeds(masks, stats, majority=0.5):
 
 
 # --------------------------------------------------------------------------- #
-# Explain every active concept for one image
+# Explain concepts for one image
 # --------------------------------------------------------------------------- #
-def explain_all_active(cbm, record, device="cuda", concepts=None,
-                       seeds=(10, 50, 100), **rex_kwargs):
-    """Explain every active concept (or the subset `concepts`) for one image.
+class ShiftedConceptView(nn.Module):
+    """Concept k with its decision threshold moved to logit `tau` (on iff z > tau)."""
 
-    rex_kwargs (iters, search_limit, batch_size) are passed to setup_rex.
+    def __init__(self, cbm, k, tau):
+        super().__init__()
+        self.cbm, self.k, self.tau = cbm, k, float(tau)
+
+    def forward(self, x):
+        z = self.cbm.concept_logits(x)[:, self.k] - self.tau
+        return torch.stack([torch.zeros_like(z), z], dim=1)
+
+
+def _explain_one(cbm, k, record, device, seeds, p, view, expect_cls, expect_conf,
+                 **rex_kwargs):
+    """Multi-seed ReX for one concept. Returns an aggregated dict, or None if skipped."""
+    rex, _ = setup_rex(cbm, k, record, device, view=view, **rex_kwargs)
+    target = rex.data.target
+
+    if target.classification != expect_cls:      # ReX disagrees with the probabilities
+        print(f"concept {k:3d}  skipped: ReX target is class {target.classification}, "
+              f"expected {expect_cls} (p={p:.3f})")
+        return None
+    if abs(target.confidence - expect_conf) > 1e-2:
+        print(f"concept {k:3d}  WARNING: rex_conf={target.confidence:.3f} != "
+              f"expected {expect_conf:.3f} (check preprocessing)")
+
+    masks, stats, resps = run_rex_seeds(rex, seeds)
+    agg = aggregate_seeds(masks, stats)
+    agg["responsibility"] = np.mean(list(resps.values()), axis=0)
+    agg.update(concept=k, prob=float(p), rex_conf=float(target.confidence),
+               target_class=int(target.classification))
+    return agg
+
+
+def explain_all_concepts(cbm, record, device="cuda", seeds=(10, 50, 100),
+                         n_inactive=10, inactive_mode="near_threshold", margin=1.0,
+                         concepts=None, **rex_kwargs):
+    """Explain every active concept, plus the inactive ones closest to firing.
+
+    Active concepts (p > 0.5): ReX explains why the concept is ON.
+
+    Inactive concepts (p <= 0.5), the `n_inactive` closest to firing first
+    (None = all of them, 0 = none; all 112 is ~4x the cost of active-only):
+      inactive_mode="near_threshold": the decision threshold is lowered to `margin`
+          logits below the concept's current logit, so the concept counts as "on";
+          ReX then finds the pixels that keep its evidence from falling further.
+          This explains the near-miss evidence, not the concept firing.
+      inactive_mode="off": ReX explains why the concept stays OFF. Usually small or
+          arbitrary, because masking rarely turns a concept on.
+
+    Returns {"probs": (n_concepts,) array, "concepts": {k: result dict}}; each result
+    has "status" ("active"/"inactive") and "mode" fields.
     """
-    active, probs = active_concepts(cbm, record, device)
-    todo = active if concepts is None else [k for k in concepts if k in active]
+    _, probs = active_concepts(cbm, record, device)        # one forward pass
+    order = np.argsort(-probs)
+    active = [int(k) for k in np.flatnonzero(probs > 0.5)]
+    inactive = [int(k) for k in order if probs[k] <= 0.5]  # closest to firing first
+
+    if concepts is not None:
+        keep = set(concepts)
+        active = [k for k in active if k in keep]
+        inactive = [k for k in inactive if k in keep]
+    if n_inactive is not None:
+        inactive = inactive[:n_inactive]
+
     results = {}
-
-    for k in todo:
+    jobs = [(k, "active") for k in active] + [(k, "inactive") for k in inactive]
+    for k, status in jobs:
+        p = float(probs[k])
+        if status == "active":
+            mode, view, expect_cls, expect_conf = "on", None, 1, p
+        elif inactive_mode == "off":
+            mode, view, expect_cls, expect_conf = "off", None, 0, 1.0 - p
+        else:
+            pc = float(np.clip(p, 1e-6, 1 - 1e-6))
+            tau = float(np.log(pc / (1 - pc))) - margin
+            mode = "near_threshold"
+            view = ShiftedConceptView(cbm, k, tau)
+            expect_cls, expect_conf = 1, 1.0 / (1.0 + np.exp(-margin))
         try:
-            rex, _ = setup_rex(cbm, k, record, device, **rex_kwargs)
-            target = rex.data.target
-
-            if target.classification != 1:      # ReX disagrees with active_concepts
-                print(f"concept {k:3d}  skipped: ReX target is 'off' (p={probs[k]:.3f})")
-                continue
-            if abs(target.confidence - probs[k]) > 1e-2:
-                print(f"concept {k:3d}  WARNING: rex_conf={target.confidence:.3f} "
-                      f"!= p={probs[k]:.3f} (check preprocessing)")
-
-            masks, stats, resps = run_rex_seeds(rex, seeds)
-            agg = aggregate_seeds(masks, stats)
-            agg["responsibility"] = np.mean(list(resps.values()), axis=0)
+            agg = _explain_one(cbm, k, record, device, seeds, p, view,
+                               expect_cls, expect_conf, **rex_kwargs)
         except Exception as e:
             print(f"concept {k:3d}  failed: {e}")
             continue
-
-        agg.update(concept=k, prob=float(probs[k]), rex_conf=float(target.confidence))
+        if agg is None:
+            continue
+        agg.update(status=status, mode=mode)
         results[k] = agg
-        print(f"concept {k:3d}  p={probs[k]:.3f}  rex_conf={target.confidence:.3f}  "
+        print(f"concept {k:3d}  {status:8s} {mode:14s} p={p:.3f}  "
               f"area={agg['mean_area']:.3%}  seed_iou={agg['pairwise_iou']:.2f}")
 
-    return results
+    return {"probs": probs.astype(np.float32), "concepts": results}
+
+
+def explain_all_active(cbm, record, device="cuda", concepts=None,
+                       seeds=(10, 50, 100), **rex_kwargs):
+    """Active concepts only (kept for backwards compatibility)."""
+    out = explain_all_concepts(cbm, record, device, seeds=seeds, n_inactive=0,
+                               concepts=concepts, **rex_kwargs)
+    return out["concepts"]
