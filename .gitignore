@@ -2,6 +2,8 @@
 data/
 ConceptBottleneck/
 ReX/
+*.tar
+XAI
 
 # Notebooks are not shared yet
 notebooks/
